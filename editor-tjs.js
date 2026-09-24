@@ -408,6 +408,19 @@ function rebuildFontBuf() {
   fontBuf = new TextEncoder().encode(fontFace + '\0');
 }
 
+// ── Profiling (--profile flag) ────────────────────────────────────────────────
+const _exeBasenameEarly = path.basename(tjs.args[0]).toLowerCase();
+const _isCompiledEarly  = !_exeBasenameEarly.includes('tjs');
+const PROFILE = tjs.args.slice(_isCompiledEarly ? 1 : 3).includes('--profile');
+const _profStart0 = PROFILE ? performance.now() : 0;
+let _profLast0 = _profStart0;
+function prof(label) {
+  if (!PROFILE) return;
+  const now = performance.now();
+  console.log(`[profile] ${label}: +${(now - _profLast0).toFixed(1)}ms  total=${(now - _profStart0).toFixed(1)}ms`);
+  _profLast0 = now;
+}
+
 // ── config.ini read/write ─────────────────────────────────────────────────────
 const APP_DIR = (() => {
   const fromMeta = path.dirname(import.meta.url.replace(/^file:\/\//i, ''));
@@ -729,15 +742,20 @@ function applyCppStyles(hwnd) {
   sciSend(hwnd, SCI_STYLESETFORE, SCE_C_GLOBALCLASS,    t.globalcls);
 }
 
+const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024; // 10 MB
+
 function applyLexer(hwnd, filePath) {
+  const docLen = sciSend(hwnd, SCI_GETTEXTLENGTH, 0, 0);
+  const isLarge = docLen >= LARGE_FILE_THRESHOLD;
+
   const name = lexerForPath(filePath) ?? detectLexerFromContent(hwnd);
   const lexerPtr = _lexilla.symbols.CreateLexer(name ?? 'null');
   sciSend(hwnd, SCI_SETILEXER, 0, ptrToNum(lexerPtr));
 
-  const foldKey     = new TextEncoder().encode('fold\0');
-  const foldVal     = new TextEncoder().encode('1\0');
-  const compactKey  = new TextEncoder().encode('fold.compact\0');
-  const compactVal  = new TextEncoder().encode('0\0');
+  const foldKey    = new TextEncoder().encode('fold\0');
+  const foldVal    = new TextEncoder().encode('1\0');
+  const compactKey = new TextEncoder().encode('fold.compact\0');
+  const compactVal = new TextEncoder().encode('0\0');
   sciSend(hwnd, SCI_SETPROPERTY, foldKey,    foldVal);
   sciSend(hwnd, SCI_SETPROPERTY, compactKey, compactVal);
 
@@ -750,7 +768,11 @@ function applyLexer(hwnd, filePath) {
     sciSend(hwnd, SCI_SETKEYWORDS, 1, kw2Buf);
   }
 
-  sciSend(hwnd, SCI_COLOURISE, 0, -1);
+  if (isLarge) {
+    console.log(`[editor] large file (${(docLen/1024/1024).toFixed(1)} MB) — syntax highlight deferred`);
+  } else {
+    sciSend(hwnd, SCI_COLOURISE, 0, -1);
+  }
 }
 
 function setFontSize(hwnd, delta) {
@@ -894,13 +916,55 @@ async function cmdNew() {
   pluginEmitter.emit('open', null);
 }
 
+// Detect encoding from BOM. Returns { encoding, bomLen } or null for UTF-8/no-BOM.
+function detectBomEncoding(bytes) {
+  if (bytes[0] === 0xFF && bytes[1] === 0xFE && bytes[2] === 0x00 && bytes[3] === 0x00)
+    return { encoding: 'utf-32le', bomLen: 4 };
+  if (bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0xFE && bytes[3] === 0xFF)
+    return { encoding: 'utf-32be', bomLen: 4 };
+  if (bytes[0] === 0xFF && bytes[1] === 0xFE)
+    return { encoding: 'utf-16le', bomLen: 2 };
+  if (bytes[0] === 0xFE && bytes[1] === 0xFF)
+    return { encoding: 'utf-16be', bomLen: 2 };
+  if (bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF)
+    return { encoding: 'utf-8-bom', bomLen: 3 };
+  return null;
+}
+
 async function cmdOpenPath(filePath) {
   try {
+    prof('cmdOpenPath: start');
     const raw  = await tjs.readFile(filePath);
-    const text = new TextDecoder().decode(raw);
-    const buf  = new TextEncoder().encode(text + '\0');
+    prof('cmdOpenPath: readFile');
+
+    let fileBytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    const bom = detectBomEncoding(fileBytes);
+
+    if (bom && bom.encoding !== 'utf-8-bom') {
+      const MB_YESNO = 0x04, MB_ICONWARNING = 0x30, IDYES = 6;
+      const titleBuf = encodeWide('Encoding Warning');
+      const textBuf  = encodeWide(
+        `"${filePath}"\n\nFile appears to be ${bom.encoding.toUpperCase()} (BOM detected).\n` +
+        `Scintilla only supports UTF-8.\n\nConvert to UTF-8 and open?`
+      );
+      const r = User32.MessageBoxW(hMainWnd, textBuf, titleBuf, MB_YESNO | MB_ICONWARNING);
+      if (r !== IDYES) return;
+      const stripped = fileBytes.subarray(bom.bomLen);
+      const text = new TextDecoder(bom.encoding).decode(stripped);
+      fileBytes = new TextEncoder().encode(text);
+      prof('cmdOpenPath: encoding conversion');
+    } else if (bom && bom.encoding === 'utf-8-bom') {
+      fileBytes = fileBytes.subarray(3);
+    }
+
+    // Append NUL byte directly — avoids TextDecoder+TextEncoder round-trip
+    const buf = new Uint8Array(fileBytes.byteLength + 1);
+    buf.set(fileBytes);
+    prof('cmdOpenPath: build buf');
     sciSend(hSciWnd, SCI_SETTEXT, 0, buf);
+    prof('cmdOpenPath: SCI_SETTEXT');
     applyLexer(hSciWnd, filePath);
+    prof('cmdOpenPath: applyLexer');
     sciSend(hSciWnd, SCI_SETSAVEPOINT, 0, 0);
     sciSend(hSciWnd, SCI_EMPTYUNDOBUFFER, 0, 0);
     currentPath = filePath;
@@ -1365,26 +1429,31 @@ if (!hMainWnd) {
 
 User32.ShowWindow(hMainWnd, SW_SHOWMAXIMIZED);
 User32.UpdateWindow(hMainWnd);
+prof('ShowWindow');
 
 updateThemeCheckmarks();
 
 // Load config and open file (both async, done before pump starts)
-await loadConfig();
-applyLexer(hSciWnd, currentPath); // re-apply now that config font/theme is loaded
+await loadConfig(); prof('loadConfig');
+applyLexer(hSciWnd, currentPath); prof('applyLexer(initial)'); // re-apply now that config font/theme is loaded
 
 // tjs.args layout differs between interpreted and compiled:
 //   interpreted: [tjs.exe, "run", "script.js", ...userArgs]  → user args start at index 3
 //   compiled exe: [editor.exe, ...userArgs]                  → user args start at index 1
 const _exeBasename = path.basename(tjs.args[0]).toLowerCase();
 const isCompiled = !_exeBasename.includes('tjs');
-const argFile = tjs.args[isCompiled ? 1 : 3];
+const _userArgs = tjs.args.slice(isCompiled ? 1 : 3).filter(a => a !== '--profile');
+const argFile = _userArgs[0];
+
 if (argFile) await cmdOpenPath(argFile);
 
 // Load plugins
 pluginAPIs = await loadPlugins(path.join(APP_DIR, 'plugins'), makePluginAPI);
+prof('loadPlugins');
 rebuildPluginsMenu();
 
 const hAccel = buildAccelTable();
+if (PROFILE) console.log(`[profile] ── ready ── total=${(performance.now() - _profStart0).toFixed(1)}ms`);
 console.log('Editor running. Close the window to exit.');
 
 // ── Non-blocking PeekMessage pump ────────────────────────────────────────────

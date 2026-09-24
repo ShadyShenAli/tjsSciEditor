@@ -964,6 +964,17 @@ var fontBuf = new TextEncoder().encode(fontFace + "\0");
 function rebuildFontBuf() {
   fontBuf = new TextEncoder().encode(fontFace + "\0");
 }
+var _exeBasenameEarly = path2.basename(tjs.args[0]).toLowerCase();
+var _isCompiledEarly = !_exeBasenameEarly.includes("tjs");
+var PROFILE = tjs.args.slice(_isCompiledEarly ? 1 : 3).includes("--profile");
+var _profStart0 = PROFILE ? performance.now() : 0;
+var _profLast0 = _profStart0;
+function prof(label) {
+  if (!PROFILE) return;
+  const now = performance.now();
+  console.log(`[profile] ${label}: +${(now - _profLast0).toFixed(1)}ms  total=${(now - _profStart0).toFixed(1)}ms`);
+  _profLast0 = now;
+}
 var APP_DIR = (() => {
   const fromMeta = path2.dirname(import.meta.url.replace(/^file:\/\//i, ""));
   return fromMeta === "." || fromMeta === "" ? path2.dirname(tjs.exePath) : fromMeta;
@@ -1288,7 +1299,10 @@ function applyCppStyles(hwnd) {
   sciSend(hwnd, SCI_STYLESETFORE, SCE_C_REGEX, t.regex);
   sciSend(hwnd, SCI_STYLESETFORE, SCE_C_GLOBALCLASS, t.globalcls);
 }
+var LARGE_FILE_THRESHOLD = 10 * 1024 * 1024;
 function applyLexer(hwnd, filePath) {
+  const docLen = sciSend(hwnd, SCI_GETTEXTLENGTH2, 0, 0);
+  const isLarge = docLen >= LARGE_FILE_THRESHOLD;
   const name = lexerForPath(filePath) ?? detectLexerFromContent(hwnd);
   const lexerPtr = _lexilla.symbols.CreateLexer(name ?? "null");
   sciSend(hwnd, SCI_SETILEXER, 0, ptrToNum2(lexerPtr));
@@ -1306,7 +1320,11 @@ function applyLexer(hwnd, filePath) {
     sciSend(hwnd, SCI_SETKEYWORDS, 0, kw1Buf);
     sciSend(hwnd, SCI_SETKEYWORDS, 1, kw2Buf);
   }
-  sciSend(hwnd, SCI_COLOURISE, 0, -1);
+  if (isLarge) {
+    console.log(`[editor] large file (${(docLen / 1024 / 1024).toFixed(1)} MB) \u2014 syntax highlight deferred`);
+  } else {
+    sciSend(hwnd, SCI_COLOURISE, 0, -1);
+  }
 }
 function setFontSize(hwnd, delta) {
   fontSize = Math.max(6, Math.min(72, fontSize + delta));
@@ -1440,13 +1458,53 @@ async function cmdNew() {
   refreshTitle();
   pluginEmitter.emit("open", null);
 }
+function detectBomEncoding(bytes) {
+  if (bytes[0] === 255 && bytes[1] === 254 && bytes[2] === 0 && bytes[3] === 0)
+    return { encoding: "utf-32le", bomLen: 4 };
+  if (bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 254 && bytes[3] === 255)
+    return { encoding: "utf-32be", bomLen: 4 };
+  if (bytes[0] === 255 && bytes[1] === 254)
+    return { encoding: "utf-16le", bomLen: 2 };
+  if (bytes[0] === 254 && bytes[1] === 255)
+    return { encoding: "utf-16be", bomLen: 2 };
+  if (bytes[0] === 239 && bytes[1] === 187 && bytes[2] === 191)
+    return { encoding: "utf-8-bom", bomLen: 3 };
+  return null;
+}
 async function cmdOpenPath(filePath) {
   try {
+    prof("cmdOpenPath: start");
     const raw = await tjs.readFile(filePath);
-    const text = new TextDecoder().decode(raw);
-    const buf = new TextEncoder().encode(text + "\0");
+    prof("cmdOpenPath: readFile");
+    let fileBytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+    const bom = detectBomEncoding(fileBytes);
+    if (bom && bom.encoding !== "utf-8-bom") {
+      const MB_YESNO = 4, MB_ICONWARNING = 48, IDYES = 6;
+      const titleBuf2 = encodeWide2("Encoding Warning");
+      const textBuf = encodeWide2(
+        `"${filePath}"
+
+File appears to be ${bom.encoding.toUpperCase()} (BOM detected).
+Scintilla only supports UTF-8.
+
+Convert to UTF-8 and open?`
+      );
+      const r = User322.MessageBoxW(hMainWnd, textBuf, titleBuf2, MB_YESNO | MB_ICONWARNING);
+      if (r !== IDYES) return;
+      const stripped = fileBytes.subarray(bom.bomLen);
+      const text = new TextDecoder(bom.encoding).decode(stripped);
+      fileBytes = new TextEncoder().encode(text);
+      prof("cmdOpenPath: encoding conversion");
+    } else if (bom && bom.encoding === "utf-8-bom") {
+      fileBytes = fileBytes.subarray(3);
+    }
+    const buf = new Uint8Array(fileBytes.byteLength + 1);
+    buf.set(fileBytes);
+    prof("cmdOpenPath: build buf");
     sciSend(hSciWnd, SCI_SETTEXT2, 0, buf);
+    prof("cmdOpenPath: SCI_SETTEXT");
     applyLexer(hSciWnd, filePath);
+    prof("cmdOpenPath: applyLexer");
     sciSend(hSciWnd, SCI_SETSAVEPOINT, 0, 0);
     sciSend(hSciWnd, SCI_EMPTYUNDOBUFFER, 0, 0);
     currentPath = filePath;
@@ -1883,16 +1941,22 @@ if (!hMainWnd) {
 }
 User322.ShowWindow(hMainWnd, SW_SHOWMAXIMIZED);
 User322.UpdateWindow(hMainWnd);
+prof("ShowWindow");
 updateThemeCheckmarks();
 await loadConfig();
+prof("loadConfig");
 applyLexer(hSciWnd, currentPath);
+prof("applyLexer(initial)");
 var _exeBasename = path2.basename(tjs.args[0]).toLowerCase();
 var isCompiled = !_exeBasename.includes("tjs");
-var argFile = tjs.args[isCompiled ? 1 : 3];
+var _userArgs = tjs.args.slice(isCompiled ? 1 : 3).filter((a) => a !== "--profile");
+var argFile = _userArgs[0];
 if (argFile) await cmdOpenPath(argFile);
 pluginAPIs = await loadPlugins(path2.join(APP_DIR, "plugins"), makePluginAPI);
+prof("loadPlugins");
 rebuildPluginsMenu();
 var hAccel = buildAccelTable();
+if (PROFILE) console.log(`[profile] \u2500\u2500 ready \u2500\u2500 total=${(performance.now() - _profStart0).toFixed(1)}ms`);
 console.log("Editor running. Close the window to exit.");
 var msgBuf = new Uint8Array(MSG_SIZE);
 var msgView = new DataView(msgBuf.buffer);
